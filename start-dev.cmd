@@ -1,0 +1,16 @@
+@echo off
+SETLOCAL
+
+REM Set environment variables directly
+SET NODE_ENV=development
+SET PORT=3001
+SET SUPABASE_URL=https://yzetnnefjkykehbaoocf.supabase.co
+SET SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6ZXRubmVmamt5a2VoYmFvb2NmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTE5Nzc4NzAsImV4cCI6MjA2NzU1Mzg3MH0.2lcT7264msX29Ot3_xZUx2VsAvn2aiwt8_3l6yImhBg 
+SET SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inl6ZXRubmVmamt5a2VoYmFvb2NmIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1MTk3Nzg3MCwiZXhwIjoyMDY3NTUzODcwfQ.v6rmAvqJWWIc_jNiRw3M0x9pSyMIXybMI4ln2p4HWRw
+SET JWT_SECRET=9OpZTnOu0UuAbNE/hznRCsn2YKxk7mpfipStDBH8oAvWtc8zK95o8uim0WM4zv6rptRbpp/JHVgA8EwBmfvuLg==
+
+REM Start the server
+echo Starting server with environment variables...
+node server/server.js
+
+ENDLOCAL

@@ -1,0 +1,835 @@
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import { supabase, checkSupabaseConnection } from '../config/supabase.js';
+
+// Vérifier la connexion à Supabase au démarrage
+checkSupabaseConnection().catch(console.error);
+
+// Vérification de la clé API
+if (!process.env.GEMINI_API_KEY) {
+  console.error('ERREUR: La clé API Gemini n\'est pas configurée');
+  process.exit(1);
+}
+
+// Initialisation du client Gemini
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// Fonction pour vérifier si un utilisateur est administrateur
+async function isUserAdmin(userId) {
+  console.log(`Vérification du rôle admin pour l'utilisateur ${userId}...`);
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('role')
+      .eq('id', userId)
+      .single();
+      
+    if (error) throw error;
+    
+    const isAdmin = data?.role === 'admin';
+    console.log(`Rôle de l'utilisateur ${userId}: ${data?.role || 'non trouvé'}, Admin: ${isAdmin}`);
+    return isAdmin;
+  } catch (error) {
+    console.error('Erreur lors de la vérification du rôle admin:', {
+      userId,
+      error: error.message,
+      stack: error.stack
+    });
+    return false;
+  }
+}
+
+// Fonction pour construire le prompt système en fonction du rôle
+function buildSystemPrompt(isAdmin) {
+  const currentDate = new Date().toLocaleDateString('fr-FR', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric'
+  });
+
+  const basePrompt = `Vous êtes un assistant juridique professionnel. 
+    Répondez de manière claire, précise et professionnelle aux questions juridiques.
+    Date actuelle: ${currentDate}.
+    `;
+
+  if (isAdmin) {
+    return basePrompt + `
+    [MODE ADMIN ACTIVÉ]
+    - Vous avez accès à des fonctionnalités avancées
+    - Vous pouvez gérer les utilisateurs et les paramètres du système
+    - Vous pouvez accéder à des informations sensibles
+    - Soyez particulièrement attentif aux demandes administratives
+    - Vérifiez toujours les permissions avant d'effectuer des actions sensibles
+    - Signalez clairement quand vous utilisez des privilèges d'administrateur
+    `;
+  }
+
+  return basePrompt + `
+    [MODE UTILISATEUR]
+    - Vous répondez aux questions juridiques générales
+    - Pour les questions spécifiques à un cas, précisez que vous fournissez des informations générales
+    - En cas de doute, recommandez de consulter un avocat
+    - Ne donnez pas de conseils juridiques engageants
+    `;
+}
+
+// Fonction pour récupérer l'historique d'une conversation
+async function getConversationHistory(conversationId) {
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true });
+      
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Erreur lors de la récupération de l\'historique:', error);
+    throw error;
+  }
+}
+
+// Fonction pour créer ou récupérer une conversation
+async function getOrCreateConversation(userId) {
+  console.log(`Début de getOrCreateConversation pour l'utilisateur ${userId}`);
+  try {
+    console.log('Recherche d\'une conversation active récente...');
+    // Vérifier s'il existe une conversation active récente (moins de 30 minutes)
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .gt('created_at', new Date().toISOString() - 30 * 60 * 1000)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (error) throw error;
+
+    if (data.length > 0) {
+      console.log(`Conversation existante trouvée: ${data[0].id}`);
+      return data[0];
+    }
+
+    console.log('Aucune conversation récente trouvée, création d\'une nouvelle conversation...');
+    // Créer une nouvelle conversation
+    const { data: newConversation, error: insertError } = await supabase
+      .from('conversations')
+      .insert([
+        {
+          user_id: userId,
+          title: 'Nouvelle conversation',
+          created_at: new Date().toISOString()
+        }
+      ])
+      .select();
+
+    if (insertError) throw insertError;
+
+    console.log(`Nouvelle conversation créée: ${newConversation[0].id}`);
+    return newConversation[0];
+  } catch (error) {
+    console.error('Erreur lors de la création/récupération de la conversation:', {
+      userId,
+      error: error.message,
+      stack: error.stack
+    });
+    throw error;
+  }
+}
+
+// Fonction pour enregistrer un message
+async function saveMessage(conversationId, role, content, userId) {
+  try {
+    // Vérifier si la conversation appartient à l'utilisateur
+    const { data: conversation, error: convError } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('id', conversationId)
+      .eq('user_id', userId)
+      .single();
+
+    if (convError || !conversation) {
+      throw new Error('Conversation non trouvée ou accès non autorisé');
+    }
+
+    // Enregistrer le message
+    const { data: message, error: insertError } = await supabase
+      .from('messages')
+      .insert([
+        {
+          conversation_id: conversationId,
+          role,
+          content,
+          user_id: userId,
+          created_at: new Date().toISOString()
+        }
+      ])
+      .select();
+
+    if (insertError) throw insertError;
+
+    // Mettre à jour la date de mise à jour de la conversation
+    await supabase
+      .from('conversations')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', conversationId);
+
+    return message[0];
+  } catch (error) {
+    console.error('Erreur lors de l\'enregistrement du message:', error);
+    throw error;
+  }
+}
+
+// Fonction principale du chatbot
+
+// Configuration des rôles disponibles
+const ROLE_CONFIG = {
+  assistant: {
+    name: 'Assistant',
+    description: 'Réponses générales et aide basique',
+    color: 'bg-blue-500',
+    systemPrompt: `Tu es un assistant juridique professionnel. 
+      - Fournis des réponses claires et concises
+      - Reste sur des informations générales
+      - Pour des conseils spécifiques, recommande de consulter un expert`,
+    allowedRoles: ['*']
+  },
+  expert: {
+    name: 'Expert',
+    description: 'Analyse technique et conseils avancés',
+    color: 'bg-purple-500',
+    systemPrompt: `Tu es un expert juridique avec des connaissances approfondies.
+      - Fournis des analyses techniques détaillées
+      - Donne des conseils précis avec références légales
+      - Sois exhaustif dans tes explications`,
+    allowedRoles: ['admin', 'expert']
+  },
+  support: {
+    name: 'Support',
+    description: 'Aide et assistance client',
+    color: 'bg-green-500',
+    systemPrompt: `Tu es un agent de support client.
+      - Sois empathique et à l'écoute
+      - Aide à résoudre les problèmes pratiques
+      - Guide l'utilisateur dans ses démarches
+      - Si nécessaire, transfère à un expert ou administrateur`,
+    allowedRoles: ['admin', 'support'],
+    // Configuration supplémentaire pour le support
+    canAccessUserHistory: true,  // Peut voir l'historique des utilisateurs
+    canEscalateToAdmin: true,    // Peut transférer aux administrateurs
+    canViewSensitiveData: false  // Ne peut pas voir les données sensibles
+  },
+  // Rôle pour l'agent AI avec accès complet
+  ai_agent: {
+    name: 'Agent IA',
+    description: 'Assistant conversationnel intelligent pour utilisateurs et administrateurs',
+    allowedRoles: ['*'], // Accessible par tous, y compris les non-authentifiés
+    systemPrompt: `Vous êtes un agent conversationnel IA avancé conçu pour aider les utilisateurs et les administrateurs.
+      - Adaptez votre ton en fonction du rôle de l'utilisateur (user, admin, support)
+      - Fournissez des réponses précises et utiles
+      - Pour les utilisateurs : fournissez des réponses claires et simples
+      - Pour les administrateurs : incluez des détails techniques si nécessaire
+      - Soyez courtois et professionnel en toutes circonstances
+      - Guidez les utilisateurs vers les bonnes ressources`,
+    // Configuration avancée de l'agent AI
+    canAccessUserHistory: true,    // Peut accéder à l'historique
+    canEscalateToHuman: true,      // Peut transférer à un humain si nécessaire
+    canProvideDetailedInfo: true,  // Peut fournir des informations détaillées
+    canInteractWith: ['user', 'admin', 'support'], // Peut interagir avec ces rôles
+    isAlwaysAvailable: true        // Toujours disponible, même sans authentification
+  }
+};
+
+// Vérification de la configuration des rôles
+function validateRoleConfig() {
+  console.log('=== VÉRIFICATION DE LA CONFIGURATION DES RÔLES ===');
+  
+  // Vérifier que chaque rôle a les propriétés requises
+  for (const [role, config] of Object.entries(ROLE_CONFIG)) {
+    console.log(`\nVérification du rôle: ${role}`);
+    
+    // Vérifier les propriétés requises
+    const requiredProps = ['name', 'description', 'systemPrompt', 'allowedRoles'];
+    for (const prop of requiredProps) {
+      if (!(prop in config)) {
+        console.error(`❌ Propriété manquante: ${prop} pour le rôle ${role}`);
+      } else {
+        console.log(`✓ ${prop}: ${JSON.stringify(config[prop])}`);
+      }
+    }
+    
+    // Vérifier que allowedRoles est un tableau
+    if (config.allowedRoles && !Array.isArray(config.allowedRoles)) {
+      console.error(`❌ allowedRoles doit être un tableau pour le rôle ${role}`);
+    }
+  }
+  
+  console.log('=== FIN DE LA VÉRIFICATION ===\n');
+}
+
+// Valider la configuration au démarrage
+validateRoleConfig();
+
+export async function handleLegalChatbot(req, res) {
+  console.log('=== Début de la requête de chat ===');
+  console.log('1. Vérification des en-têtes de la requête:', JSON.stringify(req.headers, null, 2));
+  
+  const { messages, role = 'assistant', systemPrompt } = req.body;
+  const userId = req.user?.id;
+  const isAdminRequest = role === 'admin';
+  let conversation = null;
+  
+  // Récupérer ou initialiser les informations utilisateur
+  const currentUserId = req.user?.id || 'anonymous';
+  const currentUserRole = req.user?.role || 'guest';
+  
+  console.log('2. Données de la requête reçues:', {
+    hasMessages: Array.isArray(messages) ? `Oui (${messages.length} messages)` : 'Non',
+    role,
+    userId: currentUserId,
+    userRole: currentUserRole,
+    customSystemPrompt: !!systemPrompt
+  });
+  
+  // Vérifier si le rôle demandé existe
+  const roleConfig = ROLE_CONFIG[role];
+  if (!roleConfig) {
+    const availableRoles = Object.keys(ROLE_CONFIG);
+    console.error(`Rôle inconnu: ${role}`, { rolesDisponibles: availableRoles });
+    
+    return res.status(400).json({
+      error: 'Rôle invalide',
+      reply: `Désolé, le rôle "${role}" n'existe pas. Rôles disponibles: ${availableRoles.join(', ')}`,
+      details: {
+        roleDemande: role,
+        rolesDisponibles: availableRoles
+      }
+    });
+  }
+  
+  // Vérifier si l'utilisateur a la permission d'utiliser ce rôle
+  console.log('Vérification des permissions:', {
+    role,
+    currentUserRole,
+    roleConfig: {
+      name: roleConfig.name,
+      allowedRoles: roleConfig.allowedRoles
+    }
+  });
+
+  const isAdmin = currentUserRole === 'admin';
+  let hasPermission = false;
+  
+  // Vérifier les permissions spéciales pour l'agent AI
+  if (role === 'ai_agent') {
+    // L'agent AI est toujours accessible à tous
+    hasPermission = true;
+    console.log('Accès accordé pour l\'agent AI - accès public activé');
+  } else {
+    // Vérifier les permissions pour les autres rôles
+    const isPublicRole = role === 'assistant';
+    const allowedRoles = roleConfig.allowedRoles || [];
+    
+    console.log('Vérification des permissions détaillée:', {
+      isPublicRole,
+      isAdmin,
+      userRole: currentUserRole,
+      allowedRoles,
+      hasRoleAccess: allowedRoles.includes(currentUserRole),
+      hasWildcardAccess: allowedRoles.includes('*')
+    });
+    
+    hasPermission = isPublicRole || 
+                   isAdmin || 
+                   (allowedRoles.includes(currentUserRole) || 
+                    allowedRoles.includes('*'));
+  }
+  
+  console.log('Résultat de la vérification des permissions:', { hasPermission });
+  
+  if (!hasPermission) {
+    const errorDetails = {
+      timestamp: new Date().toISOString(),
+      userId: currentUserId,
+      userRole: currentUserRole,
+      requestedRole: role,
+      allowedRoles: roleConfig.allowedRoles,
+      isAdmin
+    };
+    
+    console.error('Accès refusé - Détails:', JSON.stringify(errorDetails, null, 2));
+    
+    return res.status(403).json({
+      error: 'Accès non autorisé',
+      reply: `Désolé, vous n'avez pas les autorisations nécessaires pour accéder au mode "${roleConfig.name}".`,
+      details: errorDetails
+    });
+  }
+  
+  try {
+    console.log('3. Vérification de l\'utilisateur...');
+    if (!userId) {
+      const error = 'Erreur: Utilisateur non authentifié';
+      console.error(error);
+      return res.status(401).json({ 
+        error: 'Non autorisé', 
+        reply: 'Veuillez vous connecter pour utiliser le chatbot.',
+        details: error
+      });
+    }
+    console.log('5. Utilisateur vérifié avec succès (ID:', userId, ')');
+    
+    console.log('3. Vérification des messages...');
+    console.log('Messages reçus:', JSON.stringify(messages, null, 2));
+    
+    if (!Array.isArray(messages) || messages.length === 0) {
+      console.error('Erreur: Aucun message à traiter');
+      return res.status(400).json({ 
+        error: 'Messages invalides', 
+        reply: 'Aucun message à traiter.' 
+      });
+    }
+    console.log('4. Messages valides trouvés (nombre:', messages.length, ')');
+    
+    // Vérifier le rôle de l'utilisateur
+    console.log('5. Vérification du rôle utilisateur...');
+    const userRole = req.user?.role || 'user';
+    const isAdmin = userRole === 'admin';
+    console.log(`5.1. Rôle utilisateur: ${userRole}, Admin: ${isAdmin}`);
+    
+    // Construire le prompt système avec le rôle approprié
+    console.log('6. Construction du prompt système...');
+    
+    // Vérifier si le rôle demandé existe dans la configuration
+    const roleConfig = ROLE_CONFIG[role] || ROLE_CONFIG.assistant;
+    
+    // Utiliser le prompt système du rôle ou celui fourni dans la requête
+    let systemPromptFinal = systemPrompt || roleConfig.systemPrompt;
+    
+    // Ajouter des informations contextuelles
+    const currentDateTime = new Date().toLocaleString('fr-FR', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    
+    systemPromptFinal += `\n\n[INFORMATIONS DU SYSTÈME]\n`;
+    systemPromptFinal += `- Date et heure: ${currentDateTime}\n`;
+    systemPromptFinal += `- Rôle actif: ${roleConfig.name}\n`;
+    systemPromptFinal += `- Niveau d'accès: ${userRole === 'admin' ? 'Administrateur' : (userRole === 'support' ? 'Support' : 'Utilisateur standard')}\n`;
+    
+    // Informations supplémentaires basées sur le rôle
+    if (userRole === 'admin') {
+      systemPromptFinal += `- PRIVILÈGES ADMIN: Accès complet à toutes les fonctionnalités\n`;
+      systemPromptFinal += `- Vous pouvez gérer les utilisateurs et les paramètres\n`;
+    } else if (userRole === 'support') {
+      systemPromptFinal += `- PRIVILÈGES SUPPORT: Accès à l'historique des conversations\n`;
+      systemPromptFinal += `- Vous pouvez transférer les demandes complexes à un administrateur\n`;
+    }
+    
+    // Ajouter le contexte de la conversation
+    systemPromptFinal += `\n[CONTEXTE DE LA CONVERSATION]\n`;
+    systemPromptFinal += `- Vous parlez avec un utilisateur ayant le rôle: ${userRole}\n`;
+    systemPromptFinal += `- Soyez professionnel et courtois en toutes circonstances\n`;
+    
+    // Instructions supplémentaires pour l'agent AI
+    if (role === 'ai_agent') {
+      systemPromptFinal += `\n[INSTRUCTIONS SPÉCIFIQUES POUR L'AGENT IA]\n`;
+      systemPromptFinal += `- Adaptez votre ton en fonction du rôle de l'utilisateur\n`;
+      systemPromptFinal += `- Soyez concis mais complet dans vos réponses\n`;
+      systemPromptFinal += `- Si vous n'êtes pas sûr d'une réponse, dites-le clairement\n`;
+      systemPromptFinal += `- Pour les questions complexes, proposez de transférer à un humain\n`;
+    }
+    
+    // Ajouter des informations supplémentaires pour les administrateurs
+    if (isAdmin) {
+      systemPromptFinal += '\n\n[INFORMATIONS ADMINISTRATEUR]\n';
+      systemPromptFinal += '- Vous avez des privilèges administrateur\n';
+      systemPromptFinal += '- Vous pouvez accéder à des fonctionnalités avancées\n';
+      systemPromptFinal += '- Date et heure actuelles: ' + new Date().toLocaleString('fr-FR') + '\n';
+      systemPromptFinal += '- ID de la conversation: ' + conversation.id;
+    }
+    
+    console.log('6.1. Prompt système final (longueur:', systemPromptFinal.length, 'caractères)');
+    console.log('6.2. Extrait du prompt système:"', systemPromptFinal.substring(0, 100) + '..."');
+    
+    // Récupérer ou créer une conversation
+    console.log('7. Récupération/création de la conversation...');
+    const conversation = await getOrCreateConversation(userId);
+    console.log(`7.1. Conversation récupérée/créée:`, conversation);
+    
+    if (!conversation || !conversation.id) {
+      throw new Error('Échec de la création/récupération de la conversation');
+    }
+    
+    // Récupérer le dernier message utilisateur
+    console.log('8. Récupération du dernier message utilisateur...');
+    const lastUserMessage = messages[messages.length - 1];
+    console.log('8.1. Dernier message utilisateur:', {
+      role: lastUserMessage.role,
+      contentLength: lastUserMessage.content?.length,
+      contentPreview: lastUserMessage.content?.substring(0, 50) + (lastUserMessage.content?.length > 50 ? '...' : '')
+    });
+    
+    // Enregistrer le message utilisateur
+    console.log('9. Enregistrement du message utilisateur...');
+    await saveMessage(conversation.id, 'user', lastUserMessage.content, userId);
+    console.log('9.1. Message utilisateur enregistré avec succès');
+    
+    // Préparer les messages pour l'API
+    console.log('10. Préparation des messages pour l\'API...');
+    
+    // Créer le message système avec le prompt final
+    const systemMessage = { role: 'system', content: systemPromptFinal };
+    
+    // Formater les messages utilisateur/assistant
+    const formattedMessages = messages.map(msg => ({
+      role: msg.role === 'assistant' ? 'assistant' : 'user',
+      content: msg.content
+    }));
+    
+    // Combiner les messages avec le message système en premier
+    const fullMessages = [systemMessage, ...formattedMessages];
+    
+    console.log('10.1. Messages formatés pour l\'API:');
+    fullMessages.forEach((msg, i) => {
+      console.log(`   Message ${i} (${msg.role}):`, {
+        contentLength: msg.content?.length || 0,
+        contentPreview: msg.content ? 
+          (msg.content.length > 50 ? msg.content.substring(0, 50) + '...' : msg.content) : 
+          'Aucun contenu'
+      });
+    });
+
+    let response;
+    
+    console.log('11. Initialisation du modèle Gemini...');
+    
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('Clé API Gemini non configurée');
+    }
+    
+    try {
+      
+      console.log('11.1. Configuration du modèle Gemini...');
+      const model = genAI.getGenerativeModel({ 
+        model: 'gemini-pro',
+        generationConfig: {
+          maxOutputTokens: 1000,
+          temperature: role === 'expert' ? 0.3 : 0.7,
+          topP: 0.95,
+          topK: 40
+        }
+      });
+      
+      // Préparer l'historique de conversation
+      console.log('11.2. Préparation de l\'historique de conversation...');
+      const chat = model.startChat({
+        history: [
+          {
+            role: 'user',
+            parts: [{ text: systemPromptFinal }]
+          },
+          {
+            role: 'model',
+            parts: [{ text: 'Je suis prêt à vous aider. Comment puis-je vous assister aujourd\'hui ?' }]
+          }
+        ]
+      });
+      
+      console.log('11.3. Envoi du message utilisateur...');
+      const userMessage = lastUserMessage.content;
+      console.log('11.4. Taille du message utilisateur:', userMessage.length, 'caractères');
+      
+      const result = await chat.sendMessage(userMessage);
+      console.log('11.5. Réponse brute reçue de Gemini');
+      
+      if (!result || !result.response) {
+        throw new Error('Réponse invalide de l\'API Gemini');
+      }
+      
+      response = await result.response.text();
+      console.log('11.6. Réponse traitée, longueur:', response?.length || 0);
+      
+      if (!response) {
+        throw new Error('Réponse vide de l\'API Gemini');
+      }
+    } catch (apiError) {
+      console.error('11.7. Erreur lors de l\'appel à l\'API Gemini:', {
+        message: apiError.message,
+        stack: apiError.stack,
+        code: apiError.code,
+        status: apiError.status
+      });
+      throw new Error(`Erreur lors de la génération de la réponse: ${apiError.message}`);
+    }
+
+    console.log('Réponse IA reçue, enregistrement dans la base de données...');
+    
+    // Enregistrer la réponse de l'assistant
+    try {
+      await saveMessage(conversation.id, 'assistant', response, userId);
+      console.log('Réponse enregistrée avec succès dans la base de données');
+    } catch (saveError) {
+      console.error('Erreur lors de l\'enregistrement de la réponse:', {
+        error: saveError.message,
+        stack: saveError.stack,
+        conversationId: conversation.id,
+        responseLength: response?.length
+      });
+      throw saveError;
+    }
+
+    // Formater la réponse en fonction du rôle
+    let formattedResponse = response;
+    
+    if (isAdmin && isAdminRequest) {
+      formattedResponse = `🔒 [RÉPONSE ADMIN]\n${response}\n\n*Cette réponse contient des informations sensibles accessibles uniquement aux administrateurs*`;
+    } else if (isAdmin) {
+      formattedResponse = `${response}\n\n[Note: Mode utilisateur actif - Utilisez le sélecteur de rôle pour accéder aux fonctionnalités admin]`;
+    }
+    
+    // Enregistrer la réponse de l'IA
+    console.log('13. Enregistrement de la réponse de l\'IA...');
+    await saveMessage(conversation.id, 'assistant', response, null);
+    
+    // Ajouter des métadonnées utiles pour le débogage
+    const responseData = {
+      reply: formattedResponse,
+      isAdmin: isAdmin,
+      usedAdminRights: isAdminRequest,
+      metadata: {
+        role: role,
+        conversationId: conversation.id,
+        timestamp: new Date().toISOString(),
+        model: 'gemini-pro'
+      }
+    };
+    
+    console.log('14. Envoi de la réponse au client:', JSON.stringify({
+      replyLength: responseData.reply.length,
+      ...responseData.metadata
+    }, null, 2));
+    
+    return res.status(200).json(responseData);
+    return;
+  } catch (error) {
+    const timestamp = new Date().toISOString();
+    const errorId = `err_${Math.random().toString(36).substring(2, 10)}`;
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    
+    // Détails de l'erreur pour les logs
+    const errorDetails = {
+      errorId,
+      timestamp,
+      message: error.message,
+      errorType: error.name,
+      stack: error.stack,
+      userId: req.user?.id || 'non_authentifié',
+      userRole: req.user?.role || 'invité',
+      requestedRole: req.body?.role,
+      conversationId: conversation?.id || 'non_défini',
+      requestMethod: req.method,
+      requestPath: req.path,
+      requestBody: req.body ? JSON.stringify(req.body, null, 2) : 'aucun corps de requête'
+    };
+    
+    // Journalisation détaillée
+    console.error(`[${timestamp}] [${errorId}] ERREUR CRITIQUE:`, JSON.stringify(errorDetails, null, 2));
+    
+    // Déterminer le type d'erreur et le message approprié
+    let statusCode = 500;
+    let userMessage = 'Une erreur est survenue. Veuillez réessayer plus tard.';
+    let technicalDetails = null;
+    
+    // Gestion spécifique des types d'erreur
+    if (error.name === 'AuthenticationError') {
+      statusCode = 401;
+      userMessage = 'Authentification requise. Veuillez vous connecter.';
+    } else if (error.name === 'AuthorizationError') {
+      statusCode = 403;
+      userMessage = 'Accès refusé. Vous n\'avez pas les permissions nécessaires.';
+    } else if (error.name === 'ValidationError') {
+      statusCode = 400;
+      userMessage = 'Données de requête invalides.';
+      technicalDetails = error.details;
+    } else if (error.message?.includes('API key not valid')) {
+      statusCode = 500;
+      userMessage = 'Erreur de configuration du service. Veuillez contacter le support.';
+      console.error('ERREUR CRITIQUE: Clé API invalide ou manquante');
+    }
+    
+    // Préparer la réponse d'erreur
+    const errorResponse = {
+      error: {
+        id: errorId,
+        code: statusCode,
+        message: userMessage,
+        timestamp,
+        ...(isDevelopment && {
+          details: technicalDetails || error.details,
+          type: error.name,
+          stack: error.stack,
+          request: {
+            method: req.method,
+            path: req.path,
+            query: req.query,
+            params: req.params
+          }
+        })
+      }
+    };
+    
+    // Envoyer la réponse d'erreur
+    console.error(`[${timestamp}] [${errorId}] Réponse d'erreur:`, JSON.stringify({
+      status: statusCode,
+      message: userMessage,
+      errorId,
+      ...(isDevelopment && { details: error.details })
+    }, null, 2));
+    
+    return res.status(statusCode).json(errorResponse);
+  }
+}
+
+/**
+ * Récupère la liste des conversations de l'utilisateur
+ */
+export async function getConversations(req, res) {
+  const userId = req.user?.id;
+
+  try {
+    const { data, error } = await supabase
+      .from('conversations')
+      .select('id, title, created_at, updated_at')
+      .eq('user_id', userId)
+      .eq('is_active', true)
+      .order('updated_at', { ascending: false });
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    console.error('Erreur lors de la récupération des conversations:', error);
+    res.status(500).json({ 
+      error: 'Erreur lors de la récupération des conversations',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+}
+
+/**
+ * Récupère les messages d'une conversation spécifique
+ */
+export async function getMessages(req, res) {
+  const { id: conversationId } = req.params;
+  const userId = req.user?.id;
+
+  try {
+    // Vérifier que l'utilisateur a accès à cette conversation
+    const { data: conversation, error: convError } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('id', conversationId)
+      .eq('user_id', userId)
+      .single();
+
+    if (convError || !conversation) {
+      return res.status(404).json({ error: 'Conversation non trouvée ou accès refusé' });
+    }
+
+    const { data, error } = await supabase
+      .from('messages')
+      .select('id, role, content, created_at')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    console.error('Erreur lors du traitement de la requête:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      body: req.body,
+      user: req.user,
+      timestamp: new Date().toISOString()
+    });
+    
+    const errorResponse = {
+      error: 'Erreur lors du traitement de la requête',
+      message: error.message,
+      ...(process.env.NODE_ENV === 'development' && { 
+        stack: error.stack,
+        code: error.code
+      })
+    };
+    
+    res.status(500).json(errorResponse);
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+}
+
+/**
+ * Supprime une conversation (marquage comme inactif)
+ */
+export async function deleteConversation(req, res) {
+  const { id: conversationId } = req.params;
+  const userId = req.user?.id;
+  const client = await pool.connect();
+
+  try {
+    // Vérifier que l'utilisateur est propriétaire de la conversation
+    const { data: conversation, error: convError } = await supabase
+      .from('conversations')
+      .select('id')
+      .eq('id', conversationId)
+      .eq('user_id', userId);
+
+    if (convError || !conversation || conversation.length === 0) {
+      return res.status(404).json({ error: 'Conversation non trouvée ou accès refusé' });
+    }
+
+    // Marquer la conversation comme inactive
+    await client.query(
+      'UPDATE chat_conversations SET is_active = false WHERE id = $1',
+      [conversationId]
+    );
+
+    res.json({ success: true, message: 'Conversation supprimée avec succès' });
+  } catch (error) {
+    console.error('Erreur lors du traitement de la requête:', {
+      message: error.message,
+      stack: error.stack,
+      code: error.code,
+      body: req.body,
+      user: req.user,
+      timestamp: new Date().toISOString()
+    });
+    
+    const errorResponse = {
+      error: 'Erreur lors du traitement de la requête',
+      message: error.message,
+      ...(process.env.NODE_ENV === 'development' && { 
+        stack: error.stack,
+        code: error.code
+      })
+    };
+    
+    res.status(500).json(errorResponse);
+  } finally {
+    if (client) {
+      client.release();
+    }
+  }
+}

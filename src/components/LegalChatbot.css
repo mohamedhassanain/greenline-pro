@@ -1,0 +1,200 @@
+/* Styles pour le sélecteur de rôles */
+.role-selector {
+  position: relative;
+  z-index: 10;
+}
+
+.role-button {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  background-color: #3b82f6;
+  color: white;
+  font-weight: 500;
+  transition: all 0.2s ease-in-out;
+  border: none;
+  cursor: pointer;
+}
+
+.role-button:hover {
+  background-color: #2563eb;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.role-button:focus {
+  outline: 2px solid #60a5fa;
+  outline-offset: 2px;
+}
+
+.role-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 0.5rem;
+  background-color: white;
+  border-radius: 0.5rem;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(-10px);
+  visibility: hidden;
+  transition: all 0.2s ease-in-out;
+  z-index: 20;
+}
+
+.role-dropdown.visible {
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+}
+
+.role-option {
+  display: flex;
+  flex-direction: column;
+  padding: 0.75rem 1rem;
+  text-align: left;
+  border: none;
+  background: none;
+  width: 100%;
+  transition: all 0.2s ease-in-out;
+  cursor: pointer;
+}
+
+.role-option:not(:last-child) {
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.role-option:hover {
+  background-color: #f9fafb;
+  transform: translateY(-1px);
+}
+
+.role-option:focus {
+  outline: none;
+  background-color: #f3f4f6;
+}
+
+.role-option.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background-color: #f9fafb;
+}
+
+.role-option-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+}
+
+.role-option-name {
+  font-weight: 500;
+  color: #111827;
+}
+
+.role-option-description {
+  font-size: 0.875rem;
+  color: #6b7280;
+  margin-top: 0.25rem;
+  text-align: left;
+}
+
+/* Styles pour le mode sombre */
+.dark .role-dropdown {
+  background-color: #1f2937;
+  border: 1px solid #374151;
+}
+
+.dark .role-option {
+  color: #f3f4f6;
+}
+
+.dark .role-option:not(:last-child) {
+  border-bottom-color: #374151;
+}
+
+.dark .role-option:hover {
+  background-color: #374151;
+}
+
+.dark .role-option:focus {
+  background-color: #4b5563;
+}
+
+.dark .role-option.disabled {
+  background-color: #1f2937;
+  color: #9ca3af;
+}
+
+.dark .role-option-name {
+  color: #f9fafb;
+}
+
+.dark .role-option-description {
+  color: #d1d5db;
+}
+
+/* Animation de chargement */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-spinner {
+  display: inline-block;
+  width: 1rem;
+  height: 1rem;
+  border: 2px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: spin 1s ease-in-out infinite;
+  margin-left: 0.5rem;
+}
+
+/* Styles pour le message d'aide */
+.help-text {
+  font-size: 0.875rem;
+  color: #6b7280;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  background-color: #f9fafb;
+  border-left: 3px solid #3b82f6;
+}
+
+.dark .help-text {
+  background-color: #1f2937;
+  border-left-color: #60a5fa;
+  color: #d1d5db;
+}
+
+/* Animation pour les messages système */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.system-message {
+  animation: fadeIn 0.3s ease-out forwards;
+  background-color: #f0f9ff;
+  border-left: 3px solid #0ea5e9;
+  padding: 0.75rem 1rem;
+  border-radius: 0.375rem;
+  margin: 0.5rem 0;
+}
+
+.dark .system-message {
+  background-color: #1e3a8a;
+  border-left-color: #60a5fa;
+}
